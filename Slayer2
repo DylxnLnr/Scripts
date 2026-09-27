@@ -192,7 +192,7 @@ do
     cred.AnchorPoint = Vector2.new(0.5, 0)
     cred.Size = UDim2.new(1, -40, 0, 14); cred.Position = UDim2.new(0.5, 0, 1, -16)
     cred.BackgroundTransparency = 1
-    cred.Text = "Script by <font color=\"#9C68FF\">MrPkay</font>  â€¢  UI by <font color=\"#9C68FF\">Dylxn</font>"
+    cred.Text = "Made by <font color=\"#9C68FF\">MrPkay</font> & <font color=\"#9C68FF\">Dylxn</font>"
     cred.TextColor3 = Color3.fromRGB(110, 110, 140); cred.Font = Enum.Font.Gotham
     cred.TextSize = 9; cred.TextXAlignment = Enum.TextXAlignment.Center; cred.RichText = true
 
@@ -1741,7 +1741,7 @@ CFG = {
     -- final selection
     autoFinalSelection = false, fsLead = 90, fsAllowBandage = false,
     autoDungeon = false, dungeonRepeat = true, dungeonSkipBreak = true, dungeonReward = "Balanced",
-    dungeonOneShot = true,
+    dungeonSkipBreak = false,
     dungeonReroll = true,
     dungeonWaitRegen = false,
     dungeonShop = false, dungeonShopItem = "Refinement Ore", dungeonShopTarget = 5,
@@ -3291,18 +3291,30 @@ local TRAIN_MAP = {
 function trainingStation(typeFolder)
     local tf = workspace:FindFirstChild("Training") and workspace.Training:FindFirstChild(typeFolder)
     if not tf then return nil end
+    local fallback
     for _, m in ipairs(tf:GetChildren()) do
-        if m.Name ~= "Sign" and m:IsA("Model") then return m end
+        if m.Name ~= "Sign" and m:IsA("Model") then
+            if m:FindFirstChildWhichIsA("ProximityPrompt", true) then return m end
+            fallback = fallback or m
+        end
     end
+    return fallback
 end
 function doTrainingSession(station)
     local epoch = STATE.activityEpoch
-    local root = station:FindFirstChild("Root") or station.PrimaryPart or station:FindFirstChildWhichIsA("BasePart")
-    if not root then return false end
-    tpCF(root.CFrame * CFrame.new(0, 3, 4))
-    if not STATE.waitActivity(epoch, 1.5) then return false, "stopped" end
+    if not station then return false, "no station model" end
     local prompt = station:FindFirstChildWhichIsA("ProximityPrompt", true)
-    if not prompt then return false, "no prompt" end
+        or (station.Parent and station.Parent:FindFirstChildWhichIsA("ProximityPrompt", true))
+    local root = station:FindFirstChild("Root") or station.PrimaryPart or station:FindFirstChildWhichIsA("BasePart")
+    local anchor = prompt and prompt.Parent and (
+        prompt.Parent:IsA("Attachment") and prompt.Parent.WorldPosition
+        or prompt.Parent:IsA("BasePart") and prompt.Parent.Position
+        or prompt.Parent:IsA("Model") and prompt.Parent:GetPivot().Position)
+    local target = anchor or (root and root.Position)
+    if not target then return false, "no anchor in " .. station.Name end
+    tpCF(CFrame.new(target + Vector3.new(0, 3, 4)))
+    if not STATE.waitActivity(epoch, 1.5) then return false, "stopped" end
+    if not prompt then return false, "no prompt in " .. station.Name end
     pcall(fireproximityprompt, prompt)
     local vals = getValues()
     local t0 = os.clock()
@@ -3333,8 +3345,13 @@ function trainTick(log)
                 local station = TRAIN_MAP[tn] and trainingStation(TRAIN_MAP[tn])
                 if station and p.value < p.max then
                     STATE.farmStatus = ("Training %s (%d/%d)"):format(tn, p.value, p.max)
+                    STATE.trainStatus = nil
                     local ok, why = doTrainingSession(station)
-                    if not ok then log("Training failed: " .. tostring(why)) task.wait(2) end
+                    if not ok then
+                        STATE.trainStatus = ("Training failed (%s): %s"):format(tn, tostring(why))
+                        log(STATE.trainStatus)
+                        task.wait(2)
+                    end
                     return true
                 end
                 local q = questInfo(qn)
@@ -3929,7 +3946,8 @@ end
 function LOOT.afterKill()
     local job = STATE.postKill
     if not job then return false end
-    if _stopped or not alive() or job.epoch ~= STATE.activityEpoch or not (CFG.autoChests or CFG.autoLoot)
+    if _stopped or not alive() or job.epoch ~= STATE.activityEpoch
+        or not (CFG.autoChests or CFG.autoLoot or CFG.autoSouls)
         or job.chest and (not CFG.autoChests or not job.chest.Parent) then
         if job.clearTarget and STATE.target == job.clearTarget then stopLock() end
         STATE.postKill = nil
@@ -3943,6 +3961,14 @@ function LOOT.afterKill()
             local position = LOOT.promptPosition(prompt)
             if prompt and prompt.Enabled and position and chest:GetAttribute("IsOpen") ~= true and (position - job.position).Magnitude <= job.radius then
                 positions[#positions + 1] = position
+            end
+        end
+    end
+    if CFG.autoSouls then
+        for _, inst in ipairs(CRAFT.souls.index) do
+            local part = CRAFT.souls.part(inst)
+            if part and part.Parent and (part.Position - job.position).Magnitude <= job.radius then
+                positions[#positions + 1] = part.Position
             end
         end
     end
@@ -3991,6 +4017,23 @@ function LOOT.afterKill()
     if not root or not LOOT.safe(root.Position) then
         STATE.farmStatus = "Post-kill collection waiting for safety"
         return true
+    end
+    if CFG.autoSouls and (job.soulTries or 0) < 3 then
+        local worked, reason = pcall(CRAFT.souls.tick)
+        if not worked then
+            CFG.autoSouls = false
+            CRAFT.souls.unhook()
+            warn("[Pkaizen] soul collector: " .. tostring(reason))
+            job.soulTries = 3
+        elseif reason == true then
+            job.soulTries = (job.soulTries or 0) + 1
+            job.quietSince = nil
+            job.readyAt = os.clock() + 0.1
+            STATE.farmStatus = "Post-kill: collecting Demon souls"
+            return true
+        else
+            job.soulTries = 3
+        end
     end
     if CFG.autoChests and job.stage ~= "chests" and LOOT.pendingChests(job) then
         job.stage = "chests"
@@ -7220,12 +7263,11 @@ function CRAFT.describeProgression()
     end)
     return ok and report or "Progression data unavailable"
 end
-CRAFT.souls = { status = "Inactive", collected = 0, pointsGained = 0, index = {}, seen = {}, hooked = false, lastGain = 0, exclude = { soulhandler = true, souls2x = true } }
+CRAFT.souls = { status = "Inactive", collected = 0, pointsGained = 0, index = {}, seen = {}, hooked = false, lastGain = 0 }
+CRAFT.souls.names = { ["weak soul"] = 5, ["strong soul"] = 10, ["brave soul"] = 25 }
 function CRAFT.souls.matches(name)
     if type(name) ~= "string" then return false end
-    local lower = string.lower(name)
-    if CRAFT.souls.exclude[lower] then return false end
-    return string.find(lower, "soul", 1, true) ~= nil
+    return CRAFT.souls.names[string.lower(name)] ~= nil
 end
 function CRAFT.souls.stop() CRAFT.souls.status = "Inactive" end
 function CRAFT.souls.wait(reason) CRAFT.souls.status = reason; STATE.farmStatus = reason end
@@ -7305,7 +7347,8 @@ CRAFT.souls.pick = function()
     local origin, character = hrp.Position, getChar()
     local best, bestPart, bestDist
     for _, inst in ipairs(manager.index) do
-        if not (character and inst:IsDescendantOf(character)) then
+        if not (character and inst:IsDescendantOf(character))
+            and not inst:FindFirstChildWhichIsA("Humanoid", true) then
             local part = manager.part(inst)
             if part and part.Parent and part:IsDescendantOf(workspace) then
                 local dist = (part.Position - origin).Magnitude
@@ -7388,7 +7431,8 @@ CRAFT.souls.tick = function()
     manager.sweep()
     local inst, part, dist = manager.pick()
     if inst and part then
-        manager.status = ("Collecting %s (%d studs)"):format(inst.Name, math.floor((dist or 0) + 0.5))
+        manager.status = ("Collecting %s +%d (%d studs)"):format(
+            inst.Name, manager.names[string.lower(inst.Name)] or 0, math.floor((dist or 0) + 0.5))
         local ok, _, why = manager.collect(inst, part)
         if not ok then manager.status = why or ("%s did not register"):format(inst.Name) end
         return true
@@ -7834,44 +7878,6 @@ function STATE.dungeon.findPrompt(name, action)
             and (not name or prompt.Name == name) and (not action or prompt.ActionText == action) then return prompt end
     end
 end
-function STATE.dungeon.oneShotTick()
-    if _stopped or not CFG.autoDungeon or not CFG.dungeonOneShot or not alive()
-        or workspace:GetAttribute("MinigameKey") ~= "Ouwigahara"
-        or LP:GetAttribute("InShops") or LP:GetAttribute("Spectating") then return end
-    local manager, now = STATE.dungeon, os.clock()
-    if now < (manager.nextOneShot or 0) then return end
-    manager.nextOneShot = now + 0.2
-    manager.oneShotAttempts = manager.oneShotAttempts or setmetatable({}, { __mode = "k" })
-    for _, entry in ipairs(liveMobs()) do
-        local model, humanoid = entry.model, entry.hum
-        if model.Parent and model ~= getChar() and not Players:GetPlayerFromCharacter(model)
-            and not model:FindFirstChild("OuwigaharaAlly")
-            and humanoid and humanoid.Health > 0 and humanoid.MaxHealth > 0
-            and humanoid.Health <= humanoid.MaxHealth * 0.99 then
-            local attempt = manager.oneShotAttempts[humanoid]
-            local root = model:FindFirstChild("HumanoidRootPart")
-            if (not attempt or (attempt.count < 2 and now >= attempt.nextTry
-                and humanoid.Health <= attempt.health - humanoid.MaxHealth * 0.01))
-                and root and root:IsA("BasePart") and type(isnetworkowner) == "function" then
-                local checked, owned = pcall(isnetworkowner, root)
-                if checked and owned == true then
-                    manager.oneShotAttempts[humanoid] = {
-                        count = (attempt and attempt.count or 0) + 1,
-                        health = humanoid.Health, nextTry = now + 2,
-                    }
-                    local ok, reason = pcall(function() humanoid.Health = 0 end)
-                    if not ok then
-                        CFG.dungeonOneShot = false
-                        manager.oneShotError = tostring(reason)
-                        syncUI()
-                        return
-                    end
-                    manager.oneShotWrites = (manager.oneShotWrites or 0) + 1
-                end
-            end
-        end
-    end
-end
 function STATE.dungeon.tick()
     local manager = STATE.dungeon
     local intermission = RS:FindFirstChild("Intermission")
@@ -7931,7 +7937,6 @@ function STATE.dungeon.tick()
         end
     elseif phase == "combat" then
         if not alive() then return end
-        manager.oneShotTick()
         local root, target = getHRP(), STATE.target
         local humanoid = target and target.Parent and target:FindFirstChildOfClass("Humanoid")
         if not humanoid or humanoid.Health <= 0 then
@@ -7990,6 +7995,17 @@ task.spawn(function() -- farm / boss loop (fast)
                 if LOOT.queueNearbyChest(true) then return end
                 if rushed then return end
             end
+            if CFG.autoSouls then
+                CRAFT.souls.busy = true
+                local worked, reason = pcall(CRAFT.souls.tick)
+                CRAFT.souls.busy = false
+                if not worked then
+                    CFG.autoSouls = false
+                    CRAFT.souls.unhook()
+                    warn("[Pkaizen] soul collector: " .. tostring(reason))
+                    notify("Souls", "Collector stopped: " .. tostring(reason))
+                elseif reason == true then return end
+            end
             local goal = reachedFarmGoal()
             if goal then
                 setActivity(nil, false)
@@ -8017,17 +8033,6 @@ task.spawn(function() -- farm / boss loop (fast)
                 if not worked then error(reason) end
                 if reason ~= false then STATE.farmStatus = CRAFT.slayer.status; return end
             end
-            if CFG.autoSouls then
-                CRAFT.souls.busy = true
-                local worked, reason = pcall(CRAFT.souls.tick)
-                CRAFT.souls.busy = false
-                if not worked then
-                    CFG.autoSouls = false
-                    CRAFT.souls.unhook()
-                    warn("[Pkaizen] soul collector: " .. tostring(reason))
-                    notify("Souls", "Collector stopped: " .. tostring(reason))
-                elseif reason == true then return end
-            end
             if CFG.autoLoot and (CFG.autoFarm or CFG.autoBoss or CFG.autoQuests)
                 and os.clock() >= (LOOT.nextSweep or 0) then
                 LOOT.nextSweep = os.clock() + 1
@@ -8037,7 +8042,9 @@ task.spawn(function() -- farm / boss loop (fast)
             if CFG.autoBoss then
                 bossTick()
             elseif CFG.autoTrain then
-                if not trainTick() then setStatus("Training: no active training objective") end
+                if not trainTick(function(reason) setStatus(tostring(reason)) end) then
+                    setStatus(STATE.trainStatus or "Training: no active training objective")
+                end
             elseif CFG.autoQuests and (CFG.collectionQuest or "") ~= "" then
                 collectionTick()
             elseif CFG.autoFarm or CFG.autoPower or CFG.autoQuests then
@@ -8260,6 +8267,127 @@ function setAntiAfk(on)
 end
 setAntiAfk(CFG.antiAfk)
 
+-- === PLAYER ===
+CFG.fly = false
+CFG.flySpeed = 80
+CFG.noclip = false
+CFG.speedHack = false
+CFG.walkSpeed = 50
+PLAYER = { conn = nil, baseSpeed = nil, colliders = nil, char = nil, last = nil, bumped = 0, bumpReason = nil }
+function PLAYER.active() return CFG.fly or CFG.noclip or CFG.speedHack end
+function PLAYER.snapshot()
+    local character = getChar()
+    if not character then return end
+    if PLAYER.char ~= character then
+        PLAYER.char = character
+        PLAYER.colliders = setmetatable({}, { __mode = "k" })
+        PLAYER.baseSpeed = nil
+    end
+end
+function PLAYER.collide(part, value)
+    local store = PLAYER.colliders
+    if not store or not part:IsA("BasePart") then return end
+    if store[part] == nil then store[part] = part.CanCollide end
+    part.CanCollide = value
+end
+function PLAYER.restore()
+    if PLAYER.colliders then
+        for part, value in pairs(PLAYER.colliders) do
+            if part.Parent then pcall(function() part.CanCollide = value end) end
+        end
+    end
+    PLAYER.colliders, PLAYER.char = nil, nil
+    PLAYER.last, PLAYER.bumped, PLAYER.bumpReason = nil, 0, nil
+    local character = getChar()
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if humanoid then
+        if PLAYER.baseSpeed then humanoid.WalkSpeed = PLAYER.baseSpeed end
+        humanoid.AutoRotate = true
+        humanoid.PlatformStand = false
+    end
+    PLAYER.baseSpeed = nil
+end
+function PLAYER.direction()
+    local camera = workspace.CurrentCamera
+    if not camera or UserInput:GetFocusedTextBox() then return Vector3.zero end
+    local frame, dir = camera.CFrame, Vector3.zero
+    if UserInput:IsKeyDown(Enum.KeyCode.W) then dir = dir + frame.LookVector end
+    if UserInput:IsKeyDown(Enum.KeyCode.S) then dir = dir - frame.LookVector end
+    if UserInput:IsKeyDown(Enum.KeyCode.D) then dir = dir + frame.RightVector end
+    if UserInput:IsKeyDown(Enum.KeyCode.A) then dir = dir - frame.RightVector end
+    if UserInput:IsKeyDown(Enum.KeyCode.Space) then dir = dir + Vector3.new(0, 1, 0) end
+    if UserInput:IsKeyDown(Enum.KeyCode.LeftShift) then dir = dir - Vector3.new(0, 1, 0) end
+    return dir
+end
+function PLAYER.apply(dt)
+    local character, root = getChar(), getHRP()
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if not (character and root and humanoid) then return end
+    PLAYER.snapshot()
+    if CFG.speedHack then
+        local value = tonumber(CFG.walkSpeed) or 0
+        if value > 0 then
+            if not PLAYER.baseSpeed then PLAYER.baseSpeed = humanoid.WalkSpeed end
+            humanoid.WalkSpeed = value
+        end
+    end
+    if CFG.noclip then
+        for _, part in ipairs(character:GetDescendants()) do
+            PLAYER.collide(part, false)
+        end
+    end
+    if CFG.fly then
+        humanoid.AutoRotate = false
+        humanoid.Sit = false
+        humanoid.PlatformStand = true
+        root.AssemblyLinearVelocity = Vector3.zero
+        local pos = root.Position
+        if PLAYER.last then
+            local jump = (pos - PLAYER.last).Magnitude
+            local limit = (tonumber(CFG.flySpeed) or 80) * (dt or (1 / 60)) * 3 + 2
+            if jump > limit then
+                PLAYER.bumped = PLAYER.bumped + 1
+                PLAYER.bumpReason = ("%d studs en 1 frame"):format(jump)
+                if PLAYER.bumped >= 3 then
+                    CFG.fly = false
+                    PLAYER.restore()
+                    setStatus("Fly coupe: deplacement externe de " .. PLAYER.bumpReason)
+                    syncUI()
+                    return
+                end
+                setStatus("Fly: deplacement externe " .. PLAYER.bumpReason .. " (" .. PLAYER.bumped .. "/3)")
+            end
+        end
+        PLAYER.last = pos
+        local dir = PLAYER.direction()
+        if dir.Magnitude > 0 then
+            local step = (tonumber(CFG.flySpeed) or 80) * (dt or (1 / 60))
+            root.CFrame = root.CFrame + dir.Unit * step
+        end
+    else
+        humanoid.PlatformStand = false
+        PLAYER.last, PLAYER.bumped, PLAYER.bumpReason = nil, 0, nil
+        if CFG.noclip then
+            local vel = root.AssemblyLinearVelocity
+            if vel.Y < -50 then
+                root.AssemblyLinearVelocity = Vector3.new(vel.X, math.max(vel.Y + (dt or (1 / 60)) * 900, -50), vel.Z)
+            end
+        end
+    end
+end
+function PLAYER.sync()
+    if not PLAYER.active() then
+        if PLAYER.conn then PLAYER.conn:Disconnect() end
+        PLAYER.conn = nil
+        PLAYER.restore()
+        return
+    end
+    if not PLAYER.conn or not PLAYER.conn.Connected then
+        PLAYER.conn = RunService.RenderStepped:Connect(function(dt) PLAYER.apply(dt) end)
+    end
+    PLAYER.apply(1 / 60)
+end
+
 -- === UI ===
 local STAT_NODES = { "Additional Damage", "Max Health", "Stamina Regen Speed", "Max Stamina", "Health Regen Speed", "Block Points", "Block Regen" }
 function buildUI()
@@ -8270,6 +8398,42 @@ function buildUI()
     STATE.startExp = getExp(); STATE.startWen = getWen(); STATE.startTime = os.clock()
 
     local pgOverview = GW:addPage("Overview")
+    local pgPlayer = GW:addPage("Player")
+    local secPlayer = pgPlayer:addSection("Movement")
+    local _, setFly = secPlayer:addToggle("Fly", CFG.fly, function(enabled)
+        CFG.fly = enabled
+        PLAYER.sync()
+    end)
+    toggleSetters.fly = setFly
+    local _, setFlySpeed = secPlayer:addSlider("Fly speed (studs/s)", CFG.flySpeed, 5, 500, function(value)
+        CFG.flySpeed = value
+    end)
+    sliderSetters.flySpeed = setFlySpeed
+    local _, setNoclip = secPlayer:addToggle("Noclip", CFG.noclip, function(enabled)
+        CFG.noclip = enabled
+        PLAYER.sync()
+    end)
+    toggleSetters.noclip = setNoclip
+    local _, setSpeedHack = secPlayer:addToggle("Walk speed", CFG.speedHack, function(enabled)
+        CFG.speedHack = enabled
+        PLAYER.sync()
+    end)
+    toggleSetters.speedHack = setSpeedHack
+    local _, setWalkSpeed = secPlayer:addSlider("Walk speed value", CFG.walkSpeed, 1, 500, function(value)
+        CFG.walkSpeed = value
+        PLAYER.sync()
+    end)
+    sliderSetters.walkSpeed = setWalkSpeed
+    local _, setPlayerRestore = secPlayer:addButton("Disable all (fly / noclip / speed)", function()
+        CFG.fly = false; CFG.noclip = false; CFG.speedHack = false
+        PLAYER.sync()
+        syncUI()
+    end)
+    secPlayer:addLabel("Fly: WASD to move, Space / Left Shift for up and down")
+    secPlayer:addLabel("Noclip and walk speed re-apply after every respawn")
+    customSync[#customSync + 1] = function()
+        PLAYER.sync()
+    end
     local pgFarm = GW:addPage("Farm")
     local pgCombat = GW:addPage("Combat")
     local pgQuests = GW:addPage("Quests")
@@ -8297,12 +8461,6 @@ function buildUI()
         toggleSetters.dungeonRepeat = repeatToggle
         local _, regenToggle = section:addToggle("Wait for health regeneration", CFG.dungeonWaitRegen, function(enabled) CFG.dungeonWaitRegen = enabled end)
         toggleSetters.dungeonWaitRegen = regenToggle
-        local _, oneShotToggle = section:addToggle("One Shot (experimental, client-side)", CFG.dungeonOneShot, function(enabled)
-            CFG.dungeonOneShot = enabled
-            STATE.dungeon.nextOneShot = nil
-            STATE.dungeon.oneShotError = nil
-        end)
-        toggleSetters.dungeonOneShot = oneShotToggle
         local _, skipToggle = section:addToggle("Skip wave breaks", CFG.dungeonSkipBreak, function(enabled) CFG.dungeonSkipBreak = enabled end)
         toggleSetters.dungeonSkipBreak = skipToggle
         local _, rerollToggle = section:addToggle("Reroll weak hands (run tickets)", CFG.dungeonReroll, function(enabled) CFG.dungeonReroll = enabled end)
@@ -9581,13 +9739,17 @@ _G.PkaizenOuwland = {
         _stopped = true
         pcall(stopLock)
         pcall(CRAFT.slayer.stop)
+        pcall(CRAFT.souls.unhook)
         pcall(fishHookRemove)
         pcall(function() for k, v in pairs(CFG) do if type(v) == "boolean" then CFG[k] = false end end end)
+        pcall(function() CFG.fly = false; CFG.noclip = false; CFG.speedHack = false; PLAYER.sync() end)
         pcall(function() if antiAfkConn then antiAfkConn:Disconnect() end end)
         pcall(function() if teleportConn then teleportConn:Disconnect() end end)
     end,
     onClose = function()
         CFG.autoSlayer = false
+        CFG.fly = false; CFG.noclip = false; CFG.speedHack = false
+        pcall(PLAYER.sync)
         STATE.activityEpoch = (STATE.activityEpoch or 0) + 1
         pcall(CRAFT.slayer.stop)
         pcall(stopLock)
