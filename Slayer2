@@ -5926,7 +5926,7 @@ function setActivity(key, enabled)
         local compatible = sharedFarm and (activity == "autoFarm" or activity == "autoQuests" or activity == "autoSlayer")
         CFG[activity] = activity == key and enabled or activity ~= key and compatible and CFG[activity] == true or false
     end
-    if not key then CFG.autoLoot = false; CFG.autoChests = false; CFG.marketAutoBuy = false; CFG.autoBestGear = false end
+    if not key then CFG.autoLoot = false; CFG.autoChests = false; CFG.marketAutoBuy = false; CFG.autoBestGear = false; CFG.autoSouls = false end
     stopLock()
     STATE.currentQuest = nil
     STATE.questStatus = nil
@@ -6898,6 +6898,7 @@ CFG.slayerAllowBuy = false
 CFG.slayerFarm = true
 CFG.slayerBudget = 0
 CFG.slayerReserve = 1000
+CFG.autoSouls = false
 CRAFT.slayer = { spent = 0, status = "Inactive", names = { "Small Gourd", "Medium Gourd", "Large Gourd" } }
 function CRAFT.slayer.stop()
     local manager = CRAFT.slayer
@@ -7218,6 +7219,189 @@ function CRAFT.describeProgression()
         end)
     end)
     return ok and report or "Progression data unavailable"
+end
+CRAFT.souls = { status = "Inactive", collected = 0, pointsGained = 0, index = {}, seen = {}, hooked = false, lastGain = 0, exclude = { soulhandler = true, souls2x = true } }
+function CRAFT.souls.matches(name)
+    if type(name) ~= "string" then return false end
+    local lower = string.lower(name)
+    if CRAFT.souls.exclude[lower] then return false end
+    return string.find(lower, "soul", 1, true) ~= nil
+end
+function CRAFT.souls.stop() CRAFT.souls.status = "Inactive" end
+function CRAFT.souls.wait(reason) CRAFT.souls.status = reason; STATE.farmStatus = reason end
+function CRAFT.souls.pause(reason)
+    CFG.autoSouls = false
+    STATE.activityEpoch = (STATE.activityEpoch or 0) + 1
+    CRAFT.souls.unhook()
+    CRAFT.souls.status = reason; STATE.farmStatus = reason
+    syncUI()
+end
+CRAFT.souls.progress = function()
+    local progression = CRAFT.progressionModule
+    if not progression then return nil end
+    return asGame(function()
+        if not table.find(progression.SidesFor(LP), "Demon") then return nil end
+        if progression.Get(LP, "Demon") == nil then return nil end
+        return {
+            level = progression.GetLevel(LP, "Demon"),
+            current = progression.GetCurrent(LP, "Demon"),
+            max = progression.GetMax(LP, "Demon"),
+            remaining = progression.Remaining(LP, "Demon"),
+            atMax = progression.IsMaxLevel(LP, "Demon"),
+        }
+    end)
+end
+CRAFT.souls.consider = function(inst)
+    local manager = CRAFT.souls
+    if manager.seen[inst] then return end
+    if not manager.matches(inst.Name) then return end
+    manager.seen[inst] = true
+    manager.index[#manager.index + 1] = inst
+end
+CRAFT.souls.sweep = function()
+    local manager = CRAFT.souls
+    for i = #manager.index, 1, -1 do
+        local inst = manager.index[i]
+        if inst.Parent == nil or not inst:IsDescendantOf(workspace) then
+            table.remove(manager.index, i)
+            manager.seen[inst] = nil
+        end
+    end
+end
+CRAFT.souls.hook = function()
+    local manager = CRAFT.souls
+    if manager.hooked then return end
+    manager.hooked = true
+    for _, inst in ipairs(workspace:GetDescendants()) do manager.consider(inst) end
+    manager.connAdded = workspace.DescendantAdded:Connect(function(inst) manager.consider(inst) end)
+    manager.connRemoved = workspace.DescendantRemoving:Connect(function(inst)
+        if manager.seen[inst] then
+            manager.seen[inst] = nil
+            for i = #manager.index, 1, -1 do
+                if manager.index[i] == inst then table.remove(manager.index, i) break end
+            end
+        end
+    end)
+end
+CRAFT.souls.unhook = function()
+    local manager = CRAFT.souls
+    for _, key in ipairs({ "connAdded", "connRemoved" }) do
+        local conn = manager[key]
+        if conn then pcall(function() conn:Disconnect() end) end
+        manager[key] = nil
+    end
+    manager.hooked = false
+    manager.index = {}
+    manager.seen = {}
+end
+CRAFT.souls.part = function(inst)
+    if inst:IsA("BasePart") then return inst end
+    return inst:FindFirstChildWhichIsA("BasePart", true)
+end
+CRAFT.souls.pick = function()
+    local manager = CRAFT.souls
+    local hrp = getHRP()
+    if not hrp then return nil end
+    local origin, character = hrp.Position, getChar()
+    local best, bestPart, bestDist
+    for _, inst in ipairs(manager.index) do
+        if not (character and inst:IsDescendantOf(character)) then
+            local part = manager.part(inst)
+            if part and part.Parent and part:IsDescendantOf(workspace) then
+                local dist = (part.Position - origin).Magnitude
+                if dist < (bestDist or math.huge) then best, bestPart, bestDist = inst, part, dist end
+            end
+        end
+    end
+    return best, bestPart, bestDist
+end
+CRAFT.souls.gain = function(before, after)
+    if not (before and after) then return 0 end
+    if after.current < before.current then return (before.max - before.current) + after.current end
+    return after.current - before.current
+end
+CRAFT.souls.prompt = function(inst)
+    if inst:IsA("ProximityPrompt") then return inst end
+    local direct = inst:FindFirstChildWhichIsA("ProximityPrompt", true)
+    if direct then return direct end
+    local grab = inst:FindFirstChild("Grab", true)
+    if grab then return grab:FindFirstChildWhichIsA("ProximityPrompt", true) end
+    return nil
+end
+CRAFT.souls.collect = function(inst, part)
+    local manager = CRAFT.souls
+    local before = manager.progress()
+    if not before then return false, 0, "no demon progression" end
+    local prompt = manager.prompt(inst)
+    local anchor = prompt and LOOT.promptPosition(prompt) or part.Position
+    local root = getHRP()
+    if root and anchor then
+        local reach = prompt and math.max(4, prompt.MaxActivationDistance - 2) or 3
+        if (root.Position - anchor).Magnitude > reach then stopLock(); tpPos(anchor, 0); task.wait(0.35) end
+    end
+    if _stopped then return false, 0, "stopped" end
+    local began = false
+    if prompt then pcall(function() asGame(function() began = true; prompt:InputHoldBegin() end) end) end
+    local hold = prompt and math.max(0.35, prompt.HoldDuration or 0.35) or 0.8
+    local deadline, gone, gained = os.clock() + hold + 1.5, false, 0
+    repeat
+        task.wait(0.05)
+        if inst.Parent == nil or not inst:IsDescendantOf(workspace) then gone = true break end
+        gained = manager.gain(before, manager.progress())
+        if gained > 0 then break end
+    until os.clock() >= deadline
+    if began then pcall(function() asGame(function() prompt:InputHoldEnd() end) end) end
+    if not gone and gained <= 0 and prompt and typeof(fireproximityprompt) == "function" then
+        pcall(function() asGame(function() fireproximityprompt(prompt) end) end)
+        local retry = os.clock() + 1.5
+        repeat
+            task.wait(0.05)
+            if inst.Parent == nil or not inst:IsDescendantOf(workspace) then gone = true break end
+            gained = manager.gain(before, manager.progress())
+            if gained > 0 then break end
+        until os.clock() >= retry
+    end
+    manager.collected = (manager.collected or 0) + 1
+    if gained > 0 then
+        manager.pointsGained = (manager.pointsGained or 0) + gained
+        manager.lastGain = gained
+        return true, gained
+    end
+    if gone then return true, 0 end
+    manager.collected = manager.collected - 1
+    return false, 0, prompt and "prompt held but the bar did not move" or "no ProximityPrompt on " .. inst.Name
+end
+CRAFT.souls.tick = function()
+    local manager = CRAFT.souls
+    if _stopped or not CFG.autoSouls then manager.stop() return false end
+    if IN_MINIGAME then manager.status = "Souls need the main world" return false end
+    if LOOT.busy or COMBAT.potionBusy or _skillLast.busy
+        or (CRAFT.slayer and (CRAFT.slayer.transacting or CRAFT.slayer.holding or CRAFT.slayer.toolbar)) then
+        manager.status = "Waiting for the current action"
+        return false
+    end
+    if not getChar() or not alive() then manager.status = "Waiting for respawn" return false end
+    local progress = manager.progress()
+    if not progress then manager.pause("Demon souls need the Demon or Hybrid race") return false end
+    if progress.atMax then manager.pause("Demon final stage reached") return false end
+    manager.hook()
+    manager.sweep()
+    local inst, part, dist = manager.pick()
+    if inst and part then
+        manager.status = ("Collecting %s (%d studs)"):format(inst.Name, math.floor((dist or 0) + 0.5))
+        local ok, _, why = manager.collect(inst, part)
+        if not ok then manager.status = why or ("%s did not register"):format(inst.Name) end
+        return true
+    end
+    manager.status = ("No souls on the ground | Stage %d | %d / %d points"):format(progress.level, progress.current, progress.max)
+    if not (CFG.autoFarm or CFG.autoBoss or CFG.autoQuests) then
+        manager.status = manager.status .. " | enable Auto Farm to spawn more"
+    end
+    return false
+end
+CRAFT.souls.describe = function()
+    local manager = CRAFT.souls
+    return manager.status .. ("\nCollected this session: %d | +%d points"):format(manager.collected or 0, manager.pointsGained or 0)
 end
 local MASTERY = {
     source = safeReq("CAM.Global.Collectibles.MasterySource"),
@@ -7833,6 +8017,17 @@ task.spawn(function() -- farm / boss loop (fast)
                 if not worked then error(reason) end
                 if reason ~= false then STATE.farmStatus = CRAFT.slayer.status; return end
             end
+            if CFG.autoSouls then
+                CRAFT.souls.busy = true
+                local worked, reason = pcall(CRAFT.souls.tick)
+                CRAFT.souls.busy = false
+                if not worked then
+                    CFG.autoSouls = false
+                    CRAFT.souls.unhook()
+                    warn("[Pkaizen] soul collector: " .. tostring(reason))
+                    notify("Souls", "Collector stopped: " .. tostring(reason))
+                elseif reason == true then return end
+            end
             if CFG.autoLoot and (CFG.autoFarm or CFG.autoBoss or CFG.autoQuests)
                 and os.clock() >= (LOOT.nextSweep or 0) then
                 LOOT.nextSweep = os.clock() + 1
@@ -8004,6 +8199,7 @@ task.spawn(function() -- status label
                 if uiRefs.progression then uiRefs.progression() end
                 if uiRefs.questStatus then uiRefs.questStatus() end
                 if uiRefs.slayer then uiRefs.slayer() end
+                if uiRefs.souls then uiRefs.souls() end
                 if uiRefs.titles then uiRefs.titles() end
                 if uiRefs.gear then uiRefs.gear() end
                 if uiRefs.refinement then uiRefs.refinement() end
@@ -8344,6 +8540,14 @@ function buildUI()
             CRAFT.slayer.spent = 0; uiRefs.slayer()
         end)
         customSync[#customSync + 1] = uiRefs.slayer
+        local _, setSoulStatus = progressionSection:addLabel(CRAFT.souls.describe())
+        uiRefs.souls = function() setSoulStatus(CRAFT.souls.describe()) end
+        local _, setSouls = progressionSection:addToggle("Auto collect Demon souls", CFG.autoSouls, function(enabled)
+            CFG.autoSouls = enabled
+            if not enabled then CRAFT.souls.unhook() end
+        end)
+        toggleSetters.autoSouls = setSouls
+        customSync[#customSync + 1] = uiRefs.souls
         local secGo = pgOverview:addSection("Activities")
         for _, title in ipairs({ "Farm", "Quests", "Powers", "Final Selection", "Fishing" }) do
             secGo:addButton(title, function() GW:SelectPage(title) end)
